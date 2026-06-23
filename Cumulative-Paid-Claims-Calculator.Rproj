@@ -11,3 +11,256 @@ Encoding: UTF-8
 
 RnwWeave: Sweave
 LaTeX: pdfLaTeX
+
+library(shiny)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+ui <- fluidPage(
+  titlePanel("Cumulative Paid Claims Calculator"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("claims_file",
+                "Upload Claims Data (CSV)",
+                accept = c(".csv")),
+      
+      numericInput("tail_factor",
+                   "Tail Factor",
+                   value = 1.10,
+                   min = 1,
+                   step = 0.01),
+      
+      helpText("Required columns: LossYear, DevelopmentYear, PaidClaims")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Input Data",
+                 DTOutput("claims_table")),
+        tabPanel("Cumulative Paid Claims",
+                 DTOutput("cum_table")),
+        tabPanel("Graph",
+                 plotOutput("cum_plot", height = "500px"))
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  claims_data <- reactive({
+    
+    req(input$claims_file)
+    
+    df <- read.csv(
+      input$claims_file$datapath,
+      stringsAsFactors = FALSE
+    )
+    
+    names(df) <- c(
+      "LossYear",
+      "DevelopmentYear",
+      "PaidClaims"
+    )
+    
+    df$LossYear <- as.numeric(df$LossYear)
+    df$DevelopmentYear <- as.numeric(df$DevelopmentYear)
+    
+    # Remove commas if present
+    df$PaidClaims <- gsub(",", "", df$PaidClaims)
+    
+    df$PaidClaims <- as.numeric(gsub(",", "", trimws(df$PaidClaims)))
+    
+    if(any(is.na(df$PaidClaims))){
+      print("Rows with invalid PaidClaims:")
+      print(df[is.na(df$PaidClaims), ])
+    }
+    
+    print(df)
+    
+    df
+  })
+  
+  output$claims_table <- renderDT({
+    print(claims_data())
+    datatable(claims_data())
+  })
+  
+  cumulative_table <- reactive({
+    
+    df <- claims_data()
+    
+    # Incremental -> cumulative
+    cum_df <- df %>%
+      arrange(LossYear, DevelopmentYear) %>%
+      group_by(LossYear) %>%
+      mutate(
+        CumulativePaid = cumsum(PaidClaims)
+      ) %>%
+      ungroup()
+    
+    # Determine full development range
+    max_dev <- max(df$DevelopmentYear)
+    
+    # Add one extra development period
+    dev_range <- 1:(max_dev + 1)
+    
+    # Triangle
+    triangle <- cum_df %>%
+      select(
+        LossYear,
+        DevelopmentYear,
+        CumulativePaid
+      ) %>%
+      pivot_wider(
+        names_from = DevelopmentYear,
+        values_from = CumulativePaid
+      )
+    
+    # Force all development columns to exist
+    for(dev in dev_range){
+      
+      dev_name <- as.character(dev)
+      
+      if(!(dev_name %in% names(triangle))){
+        triangle[[dev_name]] <- NA
+      }
+      
+    }
+    
+    triangle <- triangle %>%
+      select(
+        LossYear,
+        all_of(as.character(dev_range))
+      ) %>%
+      arrange(LossYear)
+    
+    dev_cols <- as.character(dev_range)
+    
+    # Calculate age-to-age factors
+    factors <- numeric(length(dev_cols)-1)
+    
+    for(i in 1:(length(dev_cols)-1)){
+      
+      current <- triangle[[dev_cols[i]]]
+      next_dev <- triangle[[dev_cols[i+1]]]
+      
+      valid <- !is.na(current) & !is.na(next_dev)
+      
+      if(sum(valid) > 0){
+        
+        factors[i] <-
+          sum(next_dev[valid]) /
+          sum(current[valid])
+        
+      } else {
+        
+        factors[i] <- 1
+        
+      }
+      
+    }
+    
+    # Fill missing cells using chain ladder
+    completed <- triangle
+    
+    for(r in 1:nrow(completed)){
+      
+      for(c in 2:ncol(completed)){
+        
+        if(is.na(completed[r,c])){
+          
+          prev_value <- completed[r,c-1]
+          
+          factor_index <- c-2
+          
+          completed[r,c] <-
+            prev_value * factors[factor_index]
+          
+        }
+        
+      }
+      
+    }
+    
+    # Apply tail factor to final development period
+    last_col <- names(completed)[ncol(completed)]
+    
+    completed[[last_col]] <-
+      completed[[last_col]] * input$tail_factor
+    
+    completed
+    
+  })
+  
+  output$cum_table <- renderDT({
+    
+    tbl <- round(cumulative_table(), 0)
+    
+    dt <- datatable(
+      tbl,
+      options = list(pageLength = 10)
+    )
+    
+    # Format all columns except LossYear
+    value_cols <- names(tbl)[names(tbl) != "LossYear"]
+    
+    formatCurrency(
+      dt,
+      columns = value_cols,
+      currency = "",
+      interval = 3,
+      mark = ",",
+      digits = 0
+    )
+    
+  })
+  
+  output$cum_plot <- renderPlot({
+    
+    plot_df <- cumulative_table() %>%
+      pivot_longer(
+        -LossYear,
+        names_to = "DevelopmentYear",
+        values_to = "CumulativePaid"
+      ) %>%
+      filter(!is.na(CumulativePaid))
+    
+    ggplot(
+      plot_df,
+      aes(
+        x = as.numeric(DevelopmentYear),
+        y = CumulativePaid,
+        colour = factor(LossYear),
+        group = LossYear
+      )
+    ) +
+      geom_line(linewidth = 1.2) +
+      geom_point(size = 3) +
+      
+      geom_text(
+        aes(
+          label = format(
+            round(CumulativePaid, 0),
+            big.mark = ","
+          )
+        ),
+        vjust = -0.7,
+        size = 4
+      ) +
+      
+      labs(
+        title = "Cumulative Paid Claims Development",
+        x = "Development Year",
+        y = "Cumulative Paid Claims ($)",
+        colour = "Loss Year"
+      ) +
+      theme_minimal()
+    
+  })
+}
+
+shinyApp(ui, server)
